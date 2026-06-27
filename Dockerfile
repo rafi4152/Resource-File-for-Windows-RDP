@@ -46,7 +46,7 @@ if [ -e /dev/kvm ]; then
   KVM_ARG="-enable-kvm"
   MACHINE_ARG="-machine q35,accel=kvm:tcg"
   CPU_ARG="-cpu host"
-  MEMORY="${MEMORY:-8G}"
+  MEMORY="${MEMORY:-14G}"
   SMP_CORES="${CPU_CORES:-4}"
 else
   echo "KVM not available, using TCG fallback"
