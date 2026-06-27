@@ -1,9 +1,15 @@
 FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=Etc/UTC
 
+# Use a more reliable Ubuntu mirror for Codespaces / Asia regions
+RUN sed -i \
+    -e 's|http://archive.ubuntu.com/ubuntu|http://azure.archive.ubuntu.com/ubuntu|g' \
+    -e 's|http://security.ubuntu.com/ubuntu|http://azure.archive.ubuntu.com/ubuntu|g' \
+    /etc/apt/sources.list || true
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update -o Acquire::Retries=5 && apt-get install -y --no-install-recommends \
     qemu-system-x86 \
     qemu-utils \
     novnc \
@@ -13,88 +19,86 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     net-tools \
     unzip \
     python3 \
+    ca-certificates \
+    xz-utils \
     && rm -rf /var/lib/apt/lists/*
 
+RUN mkdir -p /data /iso /novnc /opt/app
 
-RUN mkdir -p /data /iso /novnc
-
-
-RUN wget https://github.com/novnc/noVNC/archive/refs/heads/master.zip -O /tmp/novnc.zip && \
-    unzip /tmp/novnc.zip -d /tmp && \
-    mv /tmp/noVNC-master/* /novnc && \
+# noVNC
+RUN wget -q https://github.com/novnc/noVNC/archive/refs/heads/master.zip -O /tmp/novnc.zip && \
+    unzip -q /tmp/novnc.zip -d /tmp && \
+    mv /tmp/noVNC-master/* /novnc/ && \
     rm -rf /tmp/novnc.zip /tmp/noVNC-master
-
 
 ENV ISO_URL="https://archive.org/download/windows-10-lite-edition-19h2-x64/Windows%2010%20Lite%20Edition%2019H2%20x64.iso"
 
+RUN cat > /start.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
 
-RUN echo '#!/bin/bash\n\
-set -e\n\
-\n\
-# Check for KVM support\n\
-if [ -e /dev/kvm ]; then\n\
-  echo "✅ KVM acceleration available"\n\
-  KVM_ARG="-enable-kvm"\n\
-  CPU_ARG="host"\n\
-  MEMORY=${MEMORY:-12G}\n\
-  SMP_CORES=${CPU_CORES:-4}\n\
-else\n\
-  echo "⚠️  KVM not available - using slower emulation mode"\n\
-  KVM_ARG=""\n\
-  CPU_ARG="qemu64"\n\
-  MEMORY="2G"\n\
-  SMP_CORES=1\n\
-fi\n\
-\n\
-# Download ISO if needed\n\
-if [ ! -f "/iso/os.iso" ]; then\n\
-  echo "📥 Downloading Windows 10 ISO..."\n\
-  wget -q --show-progress "$ISO_URL" -O "/iso/os.iso"\n\
-fi\n\
-\n\
-# Create disk image if not exists\n\
-if [ ! -f "/data/disk.qcow2" ]; then\n\
-  echo "💽 Creating 100GB virtual disk..."\n\
-  qemu-img create -f qcow2 "/data/disk.qcow2" 100G\n\
-fi\n\
-\n\
-# Windows-specific boot parameters\n\
-BOOT_ORDER="-boot order=c,menu=on"\n\
-if [ ! -s "/data/disk.qcow2" ] || [ $(stat -c%s "/data/disk.qcow2") -lt 1048576 ]; then\n\
-  echo "🚀 First boot - installing Windows from ISO"\n\
-  BOOT_ORDER="-boot order=d,menu=on"\n\
-fi\n\
-\n\
-echo "⚙️ Starting Windows 10 VM with ${SMP_CORES} CPU cores and ${MEMORY} RAM"\n\
-\n\
-# Start QEMU with Windows-optimized settings\n\
-qemu-system-x86_64 \\\n\
-  $KVM_ARG \\\n\
-  -machine q35,accel=kvm:tcg \\\n\
-  -cpu $CPU_ARG \\\n\
-  -m $MEMORY \\\n\
-  -smp $SMP_CORES \\\n\
-  -vga std \\\n\
-  -usb -device usb-tablet \\\n\
-  $BOOT_ORDER \\\n\
-  -drive file=/data/disk.qcow2,format=qcow2 \\\n\
-  -drive file=/iso/os.iso,media=cdrom \\\n\
-  -netdev user,id=net0,hostfwd=tcp::3389-:3389 \\\n\
-  -device e1000,netdev=net0 \\\n\
-  -display vnc=:0 \\\n\
-  -name "Windows10_VM" &\n\
-\n\
-# Start noVNC\n\
-sleep 5\n\
-websockify --web /novnc 6080 localhost:5900 &\n\
-\n\
-echo "===================================================="\n\
-echo "🌐 Connect via VNC: http://localhost:6080"\n\
-echo "🔌 After install, use RDP: localhost:3389"\n\
-echo "❗ First boot may take 20-30 minutes for Windows install"\n\
-echo "===================================================="\n\
-\n\
-tail -f /dev/null\n' > /start.sh && chmod +x /start.sh
+ISO_PATH="/iso/os.iso"
+DISK_PATH="/data/disk.qcow2"
+
+echo "== Checking KVM =="
+if [ -e /dev/kvm ]; then
+  echo "KVM available"
+  KVM_ARG="-enable-kvm"
+  MACHINE_ARG="-machine q35,accel=kvm:tcg"
+  CPU_ARG="-cpu host"
+  MEMORY="${MEMORY:-8G}"
+  SMP_CORES="${CPU_CORES:-4}"
+else
+  echo "KVM not available, using TCG fallback"
+  KVM_ARG=""
+  MACHINE_ARG="-machine q35,accel=tcg"
+  CPU_ARG="-cpu qemu64"
+  MEMORY="${MEMORY:-2G}"
+  SMP_CORES="${CPU_CORES:-1}"
+fi
+
+echo "== Download ISO if missing =="
+if [ ! -f "$ISO_PATH" ]; then
+  echo "Downloading ISO..."
+  curl -L --retry 5 --retry-delay 3 -o "$ISO_PATH" "$ISO_URL"
+fi
+
+echo "== Create virtual disk if missing =="
+if [ ! -f "$DISK_PATH" ]; then
+  echo "Creating 100G qcow2 disk..."
+  qemu-img create -f qcow2 "$DISK_PATH" 100G
+fi
+
+echo "== Start QEMU =="
+qemu-system-x86_64 \
+  $KVM_ARG \
+  $MACHINE_ARG \
+  $CPU_ARG \
+  -m "$MEMORY" \
+  -smp "$SMP_CORES" \
+  -vga std \
+  -usb -device usb-tablet \
+  -boot order=d,menu=on \
+  -drive file="$DISK_PATH",format=qcow2,if=ide \
+  -cdrom "$ISO_PATH" \
+  -netdev user,id=net0,hostfwd=tcp::3389-:3389 \
+  -device e1000,netdev=net0 \
+  -display vnc=:0 \
+  -name "Windows10_VM" &
+
+echo "== Start noVNC =="
+sleep 5
+websockify --web /novnc 6080 localhost:5900 &
+
+echo "===================================================="
+echo "VNC:  http://localhost:6080"
+echo "RDP:  localhost:3389"
+echo "===================================================="
+
+tail -f /dev/null
+EOF
+
+RUN chmod +x /start.sh
 
 VOLUME ["/data", "/iso"]
 EXPOSE 6080 3389
